@@ -9,6 +9,7 @@ import httpx
 import pytest
 import respx
 from docx import Document
+from docx.oxml import parse_xml
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, Reference
 from pptx import Presentation
@@ -20,6 +21,7 @@ from reportlab.pdfgen.canvas import Canvas
 
 from app.config import Settings
 from app.parsers import FileParsingError, ParserCancelled, parse_document
+from app.storage import validate_file
 
 
 def settings(tmp_path: Path, **changes: object) -> Settings:
@@ -50,6 +52,38 @@ async def test_docx_recursive_tables_headers_stable_source_locations(tmp_path: P
     assert any(block.kind == "table_cell" and "嵌套" in block.text for block in first.blocks)
 
 
+async def test_docx_inline_content_controls_are_extracted_with_source_offsets(tmp_path: Path) -> None:
+    source = Document()
+    paragraph = source.add_paragraph("Budget: ")
+    paragraph._p.append(parse_xml('''
+        <w:sdt xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:sdtPr><w:tag w:val="amount"/></w:sdtPr>
+          <w:sdtContent>
+            <w:r><w:t>100</w:t><w:tab/></w:r>
+            <w:sdt><w:sdtPr/><w:sdtContent><w:r><w:t>million</w:t></w:r></w:sdtContent></w:sdt>
+          </w:sdtContent>
+        </w:sdt>'''))
+    paragraph.add_run(" USD.")
+    control_only = source.add_paragraph()
+    control_only._p.append(parse_xml('''
+        <w:sdt xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:sdtPr/><w:sdtContent><w:r><w:t>Required clause</w:t></w:r></w:sdtContent>
+        </w:sdt>'''))
+    source.add_paragraph("Ordinary paragraph")
+    path = tmp_path / "controls.docx"
+    source.save(path)
+
+    parsed = await parse_document(path, "main", path.name, settings(tmp_path), tmp_path)
+
+    assert [block.text for block in parsed.blocks] == ["Budget: 100\tmillion USD.", "Required clause", "Ordinary paragraph"]
+    controlled = parsed.blocks[0]
+    assert controlled.location["char_end"] == len(controlled.text)
+    assert [(run["start"], run["end"]) for run in controlled.location["runs"]] == [(0, 8), (8, 12), (12, 19), (19, 24)]
+    assert all(not block.location["commentable"] and not block.location["simple_runs"] for block in parsed.blocks[:2])
+    assert parsed.blocks[2].location["commentable"] is True
+    assert not parsed.warnings
+
+
 async def test_xlsx_formula_cache_missing_is_not_zero_and_chart_values(tmp_path: Path) -> None:
     workbook = Workbook()
     sheet = workbook.active
@@ -72,6 +106,38 @@ async def test_xlsx_formula_cache_missing_is_not_zero_and_chart_values(tmp_path:
     assert any(w.code == "chart_cache_missing" for w in parsed.warnings)
     merged = next(block for block in parsed.blocks if block.text == "合并标题")
     assert merged.location["merged_range"] == "D1:E1"
+
+
+@pytest.mark.parametrize(("references", "nonstandard_part"), [
+    (["A1:XFD1048576"], False),
+    (["A1:A600000", "B1:B600000"], True),
+])
+async def test_xlsx_rejects_merge_expansion_before_loading_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, references: list[str], nonstandard_part: bool,
+) -> None:
+    path = tmp_path / "merge-bomb.xlsx"
+    workbook = Workbook()
+    workbook.active["A1"] = "Budget 100"
+    workbook.save(path)
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    worksheet = "xl/worksheets/sheet1.xml"
+    merges = '<mergeCells count="{}">{}</mergeCells>'.format(
+        len(references), "".join(f'<mergeCell ref="{reference}"/>' for reference in references))
+    parts[worksheet] = parts[worksheet].replace(b"</worksheet>", f"{merges}</worksheet>".encode())
+    if nonstandard_part:
+        parts["xl/worksheets/custom.data"] = parts.pop(worksheet)
+        for name in ("xl/_rels/workbook.xml.rels", "[Content_Types].xml"):
+            parts[name] = parts[name].replace(b"worksheets/sheet1.xml", b"worksheets/custom.data")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
+    # Even a very small accepted upload must not expand billions of cells.
+    validate_file(path, max_unpacked_mb=1)
+    monkeypatch.setattr("app.parsers.load_workbook", lambda *args, **kwargs: pytest.fail("unsafe normal workbook loading"))
+
+    with pytest.raises(FileParsingError, match="1,000,000"):
+        await parse_document(path, "book", path.name, settings(tmp_path), tmp_path)
 
 
 async def test_pptx_groups_tables_notes_and_native_chart_cache(tmp_path: Path) -> None:
@@ -122,6 +188,27 @@ async def test_pdf_text_coordinates_and_scan_coverage_warning(tmp_path: Path) ->
     assert any(w.code == "pdf_no_text" and w.location["page"] == 2 for w in parsed.warnings)
 
 
+async def test_pdf_body_text_beside_table_survives_character_filtering(tmp_path: Path) -> None:
+    path = tmp_path / "table-and-body.pdf"
+    canvas = Canvas(str(path))
+    for y in (700, 680, 660):
+        canvas.line(100, y, 450, y)
+    for x in (100, 275, 450):
+        canvas.line(x, 660, x, 700)
+    for text, x, y in (("Project", 110, 685), ("Budget", 285, 685), ("Alpha", 110, 665),
+                       ("100", 285, 665), ("Total 900", 470, 665)):
+        canvas.drawString(x, y, text)
+    canvas.save()
+
+    parsed = await parse_document(path, "pdf", path.name, settings(tmp_path), tmp_path)
+
+    assert [block.text for block in parsed.blocks if block.kind == "table_row"] == ["Project | Budget", "Alpha | 100"]
+    body = [block for block in parsed.blocks if block.kind == "paragraph"]
+    assert [block.text for block in body] == ["Total 900"]
+    assert body[0].location["bbox"][0] == 470
+    assert not parsed.warnings
+
+
 async def test_ocr_batches_auth_count_validation_and_saved_response(tmp_path: Path) -> None:
     path = tmp_path / "scan.pdf"
     writer = PdfWriter()
@@ -163,6 +250,29 @@ async def test_ocr_failure_does_not_silently_use_local_text(tmp_path: Path) -> N
         parsed = await parse_document(path, "pdf", path.name, settings(tmp_path, paddleocr_url="https://ocr.test", llm_max_retries=0), tmp_path)
     assert not parsed.blocks
     assert any(w.code == "ocr_batch_failed" for w in parsed.warnings)
+
+
+@pytest.mark.parametrize("bad_page", [None, {"markdown": None}, {"markdown": {"text": "bad"}, "prunedResult": []}])
+async def test_ocr_malformed_pages_and_batches_preserve_other_pages(tmp_path: Path, bad_page: object) -> None:
+    path = tmp_path / "partial-ocr.pdf"
+    writer = PdfWriter()
+    for _ in range(6):
+        writer.add_blank_page(width=100, height=100)
+    writer.write(path)
+    with respx.mock as router:
+        route = router.post("https://ocr.test/layout-parsing").mock(side_effect=[
+            httpx.Response(200, json={"result": {"layoutParsingResults": [{"markdown": {"text": "page one"}}, bad_page]}}),
+            httpx.Response(200, json=[]),
+            httpx.Response(200, json={"result": {"layoutParsingResults": [
+                {"markdown": {"text": "page five"}, "prunedResult": None}, {"markdown": {"text": "page six"}}]}}),
+        ])
+        parsed = await parse_document(path, "pdf", path.name,
+                                      settings(tmp_path, paddleocr_url="https://ocr.test", paddleocr_batch_pages=2), tmp_path)
+
+    assert route.call_count == 3
+    assert [(block.location["page"], block.text) for block in parsed.blocks] == [(1, "page one"), (5, "page five"), (6, "page six")]
+    assert any(w.code == "ocr_page_failed" and w.location["page"] == 2 and w.incomplete for w in parsed.warnings)
+    assert any(w.code == "ocr_batch_failed" and w.location["page_start"] == 3 and w.location["page_end"] == 4 for w in parsed.warnings)
 
 
 async def test_password_protected_pdf_and_invalid_office_are_errors(tmp_path: Path) -> None:

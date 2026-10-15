@@ -19,8 +19,11 @@ from docx import Document
 from docx.oxml import parse_xml
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
+from docx.text.run import Run
 from lxml import etree
 from openpyxl import load_workbook
+from openpyxl.reader.excel import ExcelReader
+from openpyxl.utils.cell import range_boundaries
 from pptx import Presentation
 from pypdf import PdfReader, PdfWriter
 
@@ -32,6 +35,10 @@ NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
 }
+
+# Normal openpyxl loading expands every coordinate in a merged range, twice
+# here for formulas and saved values. ZIP byte limits do not bound that work.
+MAX_XLSX_MERGED_CELLS = 1_000_000
 
 
 class FileParsingError(ValueError):
@@ -140,6 +147,28 @@ def _scope_warning(path: Path, doc: ParsedDocument) -> None:
             _warning(doc, "smartart_excluded", "SmartArt 数据和布局未展开审查；仅提取其可直接读取的文本")
 
 
+def _paragraph_runs(paragraph: Paragraph) -> tuple[list[Run], bool]:
+    """Read inline controls without descending into separately visited text boxes."""
+    runs: list[Run] = []
+    has_controls = False
+
+    def visit(node: etree._Element) -> None:
+        nonlocal has_controls
+        for child in node:
+            if child.tag == qn("w:r"):
+                runs.append(Run(child, paragraph))
+            elif child.tag == qn("w:hyperlink"):
+                visit(child)
+            elif child.tag == qn("w:sdt"):
+                has_controls = True
+                content = child.find(qn("w:sdtContent"))
+                if content is not None:
+                    visit(content)
+
+    visit(paragraph._p)
+    return runs, has_controls
+
+
 def _docx(path: Path, doc: ParsedDocument, cancelled: Callable[[], bool] | None = None) -> None:
     document = Document(path)
     with zipfile.ZipFile(path) as archive:
@@ -153,9 +182,9 @@ def _docx(path: Path, doc: ParsedDocument, cancelled: Callable[[], bool] | None 
             tree = root.getroottree()
             for number, paragraph_node in enumerate(root.iter(qn("w:p")), 1):
                 _check_cancelled(cancelled)
-                # Paragraph.text ignores nested text boxes; their own paragraphs are visited separately.
                 paragraph = Paragraph(paragraph_node, document)
-                text = paragraph.text
+                source_runs, has_controls = _paragraph_runs(paragraph)
+                text = "".join(run.text for run in source_runs)
                 tracked = paragraph_node.xpath(".//w:ins | .//w:del") if part == "word/document.xml" else []
                 if tracked:
                     _warning(doc, "tracked_changes", "段落包含修订，提取内容可能不涵盖所有修订状态",
@@ -164,7 +193,7 @@ def _docx(path: Path, doc: ParsedDocument, cancelled: Callable[[], bool] | None 
                     continue
                 ancestors = {etree.QName(node).localname for node in paragraph_node.iterancestors()}
                 runs, cursor = [], 0
-                for run in paragraph.runs:
+                for run in source_runs:
                     runs.append({"start": cursor, "end": cursor + len(run.text),
                                  "xpath": tree.getpath(run._r)})
                     cursor += len(run.text)
@@ -176,7 +205,9 @@ def _docx(path: Path, doc: ParsedDocument, cancelled: Callable[[], bool] | None 
                 location = {
                     "part": part, "xpath": tree.getpath(paragraph_node), "paragraph": number,
                     "char_start": 0, "char_end": len(text), "runs": runs,
-                    "commentable": part == "word/document.xml" and "txbxContent" not in ancestors,
+                    # The annotation library's Paragraph.text omits inline controls.
+                    # Keep their source text, but never anchor against its different offsets.
+                    "commentable": part == "word/document.xml" and "txbxContent" not in ancestors and not has_controls,
                     "simple_runs": simple,
                 }
                 if "tc" in ancestors:
@@ -209,7 +240,41 @@ def _value(value: Any) -> str:
     return str(value)
 
 
+def _check_xlsx_merges(path: Path, cancelled: Callable[[], bool] | None) -> None:
+    """Bound merge expansion before either normal-mode workbook is constructed."""
+    total = 0
+    reader = ExcelReader(path, read_only=True, keep_links=False)
+    try:
+        # Resolve exactly the same sheet targets as the real loader, including
+        # nonstandard part paths and relationship types. Do not load any cells.
+        reader.read_manifest()
+        reader.read_workbook()
+        worksheets = [relationship.target for _, relationship in reader.parser.find_sheets()
+                      if "chartsheet" not in relationship.Type and relationship.target in reader.valid_files]
+        for name in worksheets:
+            _check_cancelled(cancelled)
+            with reader.archive.open(name) as stream:
+                for _, element in etree.iterparse(stream, events=("end",), resolve_entities=False, no_network=True):
+                    _check_cancelled(cancelled)
+                    if element.tag == "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}mergeCell":
+                        bounds = range_boundaries(element.get("ref", ""))
+                        if any(value is None for value in bounds):
+                            raise FileParsingError("Excel 合并区域无效")
+                        left, top, right, bottom = bounds
+                        if not (1 <= left <= right <= 16384 and 1 <= top <= bottom <= 1048576):
+                            raise FileParsingError("Excel 合并区域无效")
+                        total += (right - left + 1) * (bottom - top + 1)
+                        if total > MAX_XLSX_MERGED_CELLS:
+                            raise FileParsingError("Excel 合并区域累计超过 1,000,000 个单元格的安全限制")
+                    element.clear()
+                    while element.getprevious() is not None:
+                        del element.getparent()[0]
+    finally:
+        reader.archive.close()
+
+
 def _xlsx(path: Path, doc: ParsedDocument, cancelled: Callable[[], bool] | None = None) -> None:
+    _check_xlsx_merges(path, cancelled)
     formulas = load_workbook(path, data_only=False, keep_links=False)
     cached = load_workbook(path, data_only=True, keep_links=False)
     try:
@@ -306,10 +371,16 @@ def _pdf_local(path: Path, doc: ParsedDocument, cancelled: Callable[[], bool] | 
                         _add(doc, " | ".join(value or "" for value in row), "table_row",
                              {"page": number, "table": table_index, "row": row_index,
                               "bbox": list(table.bbox), "commentable": False})
-                for index, line in enumerate(page.extract_text_lines(), 1):
-                    x, y = (line["x0"] + line["x1"]) / 2, (line["top"] + line["bottom"]) / 2
-                    if any(t.bbox[0] <= x <= t.bbox[2] and t.bbox[1] <= y <= t.bbox[3] for t in tables):
-                        continue
+                def outside_tables(obj: dict[str, Any]) -> bool:
+                    if obj["object_type"] != "char":
+                        return True
+                    x, y = (obj["x0"] + obj["x1"]) / 2, (obj["top"] + obj["bottom"]) / 2
+                    return not any(t.bbox[0] <= x < t.bbox[2] and t.bbox[1] <= y < t.bbox[3] for t in tables)
+
+                # Remove only table characters before forming lines. Adjacent body
+                # text can share a baseline with a table and must remain available.
+                body = page.filter(outside_tables) if tables else page
+                for index, line in enumerate(body.extract_text_lines(), 1):
                     _add(doc, line["text"], "paragraph", {"page": number, "line": index,
                          "bbox": [line["x0"], line["top"], line["x1"], line["bottom"]], "commentable": False})
                 if not page.chars:
@@ -370,9 +441,14 @@ async def _pdf_ocr(path: Path, doc: ParsedDocument, settings: Settings, work_dir
                     break
                 response.raise_for_status()
                 data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError("OCR 响应不是对象")
                 if data.get("errorCode", 0) not in (0, None):
                     raise ValueError("OCR 服务返回错误码")
-                pages = data["result"]["layoutParsingResults"]
+                result = data.get("result")
+                if not isinstance(result, dict):
+                    raise ValueError("OCR 响应缺少结果对象")
+                pages = result.get("layoutParsingResults")
                 if not isinstance(pages, list):
                     raise ValueError("OCR 响应缺少页面数组")
                 if len(pages) != count:
@@ -382,12 +458,22 @@ async def _pdf_ocr(path: Path, doc: ParsedDocument, settings: Settings, work_dir
                 for relative, page in enumerate(pages[:count]):
                     _check_cancelled(cancelled)
                     original_page = offset + relative + 1
-                    explicit_index = page.get("page_index", page.get("prunedResult", {}).get("page_index"))
-                    if explicit_index is not None and explicit_index != relative:
+                    if not isinstance(page, dict):
+                        _warning(doc, "ocr_page_failed", "OCR 页面结构无效，无法读取文字",
+                                 {"page": original_page, "raw_response": raw_path.name})
+                        continue
+                    pruned = page.get("prunedResult")
+                    markdown = page.get("markdown", {})
+                    if (pruned is not None and not isinstance(pruned, dict)) or not isinstance(markdown, dict):
+                        _warning(doc, "ocr_page_failed", "OCR 页面结构无效，无法读取文字",
+                                 {"page": original_page, "raw_response": raw_path.name})
+                        continue
+                    explicit_index = page.get("page_index", (pruned or {}).get("page_index"))
+                    if explicit_index is not None and (type(explicit_index) is not int or explicit_index != relative):
                         _warning(doc, "ocr_page_index_mismatch", "OCR 页码索引不符合批次顺序，未使用该页",
                                  {"page": original_page})
                         continue
-                    text = page.get("markdown", {}).get("text", "")
+                    text = markdown.get("text", "")
                     if not isinstance(text, str) or not text.strip():
                         _warning(doc, "ocr_empty_page", "OCR 页面没有返回文字", {"page": original_page})
                         continue

@@ -47,6 +47,12 @@ async def execute_review(identifier: str, settings: Settings, store: Store) -> N
         claimed = db.execute("UPDATE reviews SET status='running',stage='starting',updated_at=? WHERE id=? AND rq_job_id=? AND status='queued' AND cancel_requested=0",
                              (now(), identifier, item["rq_job_id"])).rowcount
     if not claimed:
+        # Cancellation can arrive after the snapshot above but before the claim.
+        # A started RQ job then returns without ever entering the execution loop.
+        state = store.get(identifier, private=True)
+        if state and state["cancel_requested"]:
+            store.finish_current(identifier, item["rq_job_id"], settings.retention_days,
+                                 status="cancelled", expected_status="queued")
         return
     directory = review_directory(settings.data_dir, identifier)
     workspace = directory / "work"
@@ -96,7 +102,7 @@ async def execute_review(identifier: str, settings: Settings, store: Store) -> N
             try:
                 with source.open("rb") as stream:
                     fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
-                parse_key = hashlib.sha256(f"parser-v1:{fingerprint}:{settings.paddleocr_url}:{settings.paddleocr_batch_pages}".encode()).hexdigest()
+                parse_key = hashlib.sha256(f"parser-v2:{fingerprint}:{settings.paddleocr_url}:{settings.paddleocr_batch_pages}".encode()).hexdigest()
                 saved = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else None
                 if saved and saved["key"] == parse_key and not any(w.get("incomplete") for w in saved["document"]["warnings"]):
                     document = ParsedDocument.model_validate(saved["document"])

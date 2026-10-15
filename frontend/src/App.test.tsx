@@ -268,6 +268,76 @@ describe('review workspace', () => {
     expect(await screen.findByRole('button', { name: /第二个问题/ })).toHaveAttribute('aria-expanded', 'true')
   })
 
+  it('returns to the first issue page when a retry publishes fewer results', async () => {
+    let current: Review = { ...review, status: 'partial', issue_count: 21 }
+    let retried = false
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/v1/session') return json({ ready: true, retention_days: 30 })
+      if (url.includes('/issues')) {
+        const page = url.includes('page=2') ? 2 : 1
+        const items = page === 1 ? [{ ...issue, title: retried ? '重试后唯一问题' : '第一页问题' }] : current.issue_count === 21 ? [{ ...issue, id: 'i21', title: '第二页问题' }] : []
+        return json({ items, total: current.issue_count, page, page_size: 20 })
+      }
+      if (url.endsWith('/retry') && init?.method === 'POST') {
+        retried = true
+        current = { ...current, status: 'queued', stage: 'queued' }
+      }
+      return json(current)
+    })
+    vi.stubGlobal('fetch', fetch)
+    const user = userEvent.setup()
+    renderApp('/reviews/review-1')
+    await user.click(await screen.findByRole('button', { name: '下一页' }))
+    expect(await screen.findByRole('button', { name: /第二页问题/ })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '重试任务' }))
+    await screen.findByText('等待审查资源')
+    current = { ...current, status: 'completed', stage: 'completed', issue_count: 1 }
+    await act(async () => { await clients[0].invalidateQueries({ queryKey: ['review', review.id] }) })
+    expect(await screen.findByRole('button', { name: /重试后唯一问题/ })).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.queryByText('未发现审查问题')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /第二页问题/ })).not.toBeInTheDocument()
+    expect(fetch.mock.calls.filter(([url]) => url.includes('/issues')).at(-1)?.[0]).toContain('page=1&')
+  })
+
+  it('clamps the issue page when a refetch reduces the result count', async () => {
+    let total = 21
+    const fetch = vi.fn(async (url: string) => {
+      if (url === '/api/v1/session') return json({ ready: true, retention_days: 30 })
+      if (url.includes('/issues')) {
+        const page = url.includes('page=2') ? 2 : 1
+        return json({ items: page === 1 ? [issue] : total === 21 ? [{ ...issue, id: 'i21', title: '第二页问题' }] : [], total, page, page_size: 20 })
+      }
+      return json({ ...review, issue_count: total })
+    })
+    vi.stubGlobal('fetch', fetch)
+    const user = userEvent.setup()
+    renderApp('/reviews/review-1')
+    await user.click(await screen.findByRole('button', { name: '下一页' }))
+    await screen.findByRole('button', { name: /第二页问题/ })
+    total = 1
+    await act(async () => { await clients[0].invalidateQueries({ queryKey: ['issues'] }) })
+    expect(await screen.findByRole('button', { name: /预算不一致/ })).toBeInTheDocument()
+    expect(screen.queryByText('未发现审查问题')).not.toBeInTheDocument()
+    expect(fetch.mock.calls.filter(([url]) => url.includes('/issues')).at(-1)?.[0]).toContain('page=1&')
+  })
+
+  it.each([[1, 0], [0, 1]])('offers recovery instead of empty success when issue counts are %s and %s', async (reviewCount, total) => {
+    let loaded = false
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url === '/api/v1/session') return json({ ready: true, retention_days: 30 })
+      if (url.includes('/issues')) return json({ items: loaded ? [issue] : [], total, page: 1, page_size: 20 })
+      return json({ ...review, issue_count: reviewCount })
+    }))
+    const user = userEvent.setup()
+    renderApp('/reviews/review-1')
+    expect(await screen.findByText('当前页暂无问题')).toBeInTheDocument()
+    expect(screen.queryByText('未发现审查问题')).not.toBeInTheDocument()
+    expect(document.querySelector('.successful-empty')).not.toBeInTheDocument()
+    loaded = true
+    await user.click(screen.getByRole('button', { name: '重新读取问题' }))
+    expect(await screen.findByRole('button', { name: /预算不一致/ })).toBeInTheDocument()
+  })
+
   it.each(['failed', 'cancelled', 'partial'] as const)('does not present an incomplete %s review as an empty success', async status => {
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       if (url === '/api/v1/session') return json({ ready: true, retention_days: 30 })

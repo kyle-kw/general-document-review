@@ -1,9 +1,10 @@
 from pathlib import Path
+from collections.abc import AsyncIterator
 import secrets
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from redis.exceptions import RedisError
 from rq import Queue
@@ -14,6 +15,7 @@ from .job_queue import get_queue
 from .storage import SUPPORTED, remove_review, review_directory, validate_file
 from .store import Store, TERMINAL, now
 from .requirements import ReviewOptions, initial_requirements_state
+from .uploads import ReviewUpload, UPLOAD_BODY, review_form
 
 router = APIRouter()
 COOKIE = "review_browser"
@@ -34,6 +36,13 @@ def require_owner(request: Request) -> str:
     if owner is None:
         raise HTTPException(401, "浏览器身份已失效，请刷新页面")
     return owner
+
+
+async def review_upload(request: Request, owner: str = Depends(require_owner)) -> AsyncIterator[ReviewUpload]:
+    # Authentication runs before touching the request stream; File/Form parameters
+    # would make FastAPI spool the body before resolving dependencies.
+    async with review_form(request, request.app.state.settings) as submission:
+        yield submission
 
 
 def owned(request: Request, identifier: str, owner: str, *, private: bool = False) -> dict:
@@ -63,16 +72,15 @@ def public_config(request: Request, owner: str = Depends(require_owner)) -> dict
             "llm_configured": bool(settings.llm_base_url and settings.llm_model and settings.llm_api_key.get_secret_value())}
 
 
-@router.post("/reviews", status_code=202)
+@router.post("/reviews", status_code=202, openapi_extra=UPLOAD_BODY)
 async def create_review(
-    request: Request, main_file: Annotated[UploadFile, File()],
-    reference_files: Annotated[list[UploadFile] | None, File()] = None,
-    review_options: Annotated[str | None, Form()] = None,
+    request: Request, submission: Annotated[ReviewUpload, Depends(review_upload)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     owner: str = Depends(require_owner), queue: Queue = Depends(get_queue),
 ) -> dict:
     settings = request.app.state.settings
     store = store_for(request)
+    review_options = submission.review_options
     try:
         options = ReviewOptions.model_validate_json(review_options) if review_options is not None else ReviewOptions()
     except ValidationError as exc:
@@ -83,7 +91,7 @@ async def create_review(
     previous = await run_in_threadpool(store.find_key, owner, key)
     if previous:
         return previous
-    uploads = [main_file, *(reference_files or [])]
+    uploads = [submission.main_file, *submission.reference_files]
     if len(uploads) > settings.max_files:
         raise HTTPException(413, f"每个任务最多 {settings.max_files} 份文件")
     identifier = uuid4().hex

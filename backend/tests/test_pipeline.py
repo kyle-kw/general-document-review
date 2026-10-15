@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import json
 import re
 
@@ -431,3 +432,137 @@ async def test_custom_main_consistency_conflicts_mark_cross_baseline_ambiguous(t
     assert cross.category == "custom"
     assert cross.confidence == "needs_confirmation"
     assert "基准有歧义" in cross.description
+
+
+async def test_distinct_errors_with_the_same_quotation_survive_verification(tmp_path):
+    class TwoErrors(FakeClient):
+        async def run_agent(self, role, input, schema):
+            result = await super().run_agent(role, input, schema)
+            if "[proofreader]" in role:
+                span = input["spans"][0]
+                evidence = [{"document_id": span["document_id"], "block_id": span["block_id"],
+                             "quote": span["text"], "start": span["offset"],
+                             "end": span["offset"] + len(span["text"])}]
+                first = proposed("typo", evidence, "错别字")
+                first.update(description="错别自应为错别字。", suggestion="将自改为字。")
+                second = proposed("typo", evidence, "错别字")
+                second.update(description="错吴应为错误。", suggestion="将吴改为误。")
+                duplicate = {**first, "confidence": "needs_confirmation"}
+                result["issues"] = [duplicate, first, second]
+            return result
+
+    client = TwoErrors(numeric=False)
+    issues = await run_review([document("main", ["这是错别自，还有一处错吴。"])], client, tmp_path,
+                              lambda *_: None, lambda: False)
+    assert len(issues) == 2
+    assert len({issue.id for issue in issues}) == 2
+    assert {issue.suggestion for issue in issues} == {"将自改为字。", "将吴改为误。"}
+    assert all(issue.confidence == "confirmed" for issue in issues)
+    assert sum(len(payload["candidates"]) for role, payload in client.calls if role == "verifier") == 2
+
+
+@pytest.mark.parametrize("budget", [2400, 6000, 42000])
+def test_long_context_and_escaped_text_keep_every_character_within_chunk_budget(budget):
+    text = ('正文："\\\n' * 5000) + "最后一段不能丢弃。"
+    doc = document("main", [text])
+    doc.blocks[0].location.update(row_header=text, column_header=text, formula="=" + "公式" * 10000)
+    chunks = source_chunks(doc, budget)
+    covered = set()
+    for chunk in chunks:
+        assert len(json.dumps(chunk, ensure_ascii=False, sort_keys=True, separators=(",", ":"))) <= budget
+        for span in chunk["spans"]:
+            start = span["offset"]
+            assert text[start:start + len(span["text"])] == span["text"]
+            covered.update(range(start, start + len(span["text"])))
+            assert span["context"]["context_is_excerpt"]
+    assert len(covered) == len(text)
+    assert doc.blocks[0].location["row_header"] == text
+
+
+async def test_long_docx_table_headers_stay_bounded_through_all_review_stages(tmp_path):
+    from docx import Document
+    from app.parsers import _docx
+
+    source = Document()
+    table = source.add_table(rows=2, cols=1)
+    text = "合同金额100元。这里有错别自。" + "补充说明。" * 5000
+    table.cell(0, 0).text = text
+    table.cell(1, 0).text = "合同金额200元。"
+    path = tmp_path / "long-table.docx"
+    source.save(path)
+    doc = ParsedDocument(id="main", filename=path.name, format="docx")
+    _docx(path, doc)
+    assert doc.blocks[0].location["row_header"] == text
+    client = CustomClient()
+    client.numeric = True
+    issues = await run_review([doc], client, tmp_path / "checkpoints", lambda *_: None,
+                              lambda: False, requirements=requirements(kind="consistency"))
+    assert {issue.category for issue in issues} >= {"typo", "numeric"}
+    for role in ("facts", "numeric", "custom_compare", "verifier"):
+        assert any(name == role for name, _ in client.calls)
+    assert all(len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) <= client.context_chars - 3000
+               for _, payload in client.calls)
+    chunks = [payload for role, payload in client.calls if role == "facts"]
+    covered = {offset for chunk in chunks for span in chunk["spans"] if span["block_id"] == doc.blocks[0].id
+               for offset in range(span["offset"], span["offset"] + len(span["text"]))}
+    assert len(covered) == len(text)
+
+
+@pytest.mark.parametrize("invalid_role", ["proofreader", "facts", "numeric", "semantic", "cross", "verifier",
+                                         "custom_scan", "custom_absence", "custom_compare"])
+async def test_invalid_business_results_do_not_poison_retry_checkpoints(tmp_path, invalid_role):
+    class InvalidOnce(CustomClient):
+        async def run_agent(self, role, input, schema):
+            result = await super().run_agent(role, input, schema)
+            if not self.invalid or f"[{invalid_role}]" not in role:
+                return result
+            bad_evidence = [{"document_id": "main", "block_id": "absent", "quote": "不存在的引文",
+                             "start": 0, "end": 7}]
+            if invalid_role == "proofreader":
+                result["reviewed_span_ids"] = []
+            elif invalid_role == "facts":
+                result["facts"][0]["evidence"] = bad_evidence
+            elif invalid_role in {"numeric", "semantic", "cross"}:
+                result["issues"] = [proposed(invalid_role if invalid_role != "cross" else "numeric", bad_evidence)]
+            elif invalid_role == "verifier":
+                result["decisions"] = []
+            elif invalid_role in {"custom_scan", "custom_absence"}:
+                result["rules"][0]["rule_id"] = "custom-9"
+            else:
+                issue = proposed("semantic", bad_evidence)
+                issue.pop("category")
+                result["issues"] = [{"rule_id": "custom-9", **issue}]
+            return result
+
+    docs = [document("main", ["合同金额100元。", "合同金额200元。"]), document("other", ["合同金额300元。"])]
+    client = InvalidOnce()
+    client.invalid = True
+    client.numeric = True
+    with pytest.raises(AgentError):
+        await run_review(docs, client, tmp_path, lambda *_: None, lambda: False, requirements=requirements())
+    assert not list((tmp_path / "agents").glob(f"{invalid_role}-*.json"))
+    valid_checkpoints = {path: path.read_bytes() for path in (tmp_path / "agents").glob("*.json")}
+    client.invalid = False
+    issues = await run_review(docs, client, tmp_path, lambda *_: None, lambda: False, requirements=requirements())
+    assert issues
+    assert all(path.read_bytes() == contents for path, contents in valid_checkpoints.items())
+    assert list((tmp_path / "agents").glob(f"{invalid_role}-*.json"))
+
+
+async def test_legacy_invalid_checkpoint_is_revalidated_without_discarding_good_siblings(tmp_path):
+    client = FakeClient(numeric=False)
+    docs = [document("main", ["正常文字。"])]
+    await run_review(docs, client, tmp_path, lambda *_: None, lambda: False)
+    path = next((tmp_path / "agents").glob("proofreader-*.json"))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved["output"]["reviewed_span_ids"] = []
+    saved["output_hash"] = hashlib.sha256(json.dumps(saved["output"], ensure_ascii=False, sort_keys=True,
+                                                    separators=(",", ":")).encode()).hexdigest()
+    path.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+    sibling = next((tmp_path / "agents").glob("facts-*.json"))
+    sibling_before = sibling.read_bytes(), sibling.stat().st_mtime_ns
+    previous_calls = len(client.calls)
+    assert await run_review(docs, client, tmp_path, lambda *_: None, lambda: False) == []
+    assert [role for role, _ in client.calls[previous_calls:]] == ["proofreader"]
+    assert (sibling.read_bytes(), sibling.stat().st_mtime_ns) == sibling_before
+    assert json.loads(path.read_text(encoding="utf-8"))["output"]["reviewed_span_ids"]

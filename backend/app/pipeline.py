@@ -220,20 +220,43 @@ def _pack(items: Iterable[dict[str, Any]], budget: int) -> list[list[dict[str, A
     return pages
 
 
-def _source_context(location: dict[str, Any]) -> dict[str, Any]:
-    """Only semantic/source labels, never DOCX run maps or OOXML paths."""
+def _source_context(location: dict[str, Any], budget: int = 800) -> dict[str, Any]:
+    """Bound auxiliary labels; the complete source text remains in source spans."""
     allowed = {"sheet", "cell", "row", "column", "row_header", "column_header", "number_format",
                "formula", "merged_range", "slide", "shape", "shape_name", "paragraph", "page",
                "series", "category", "chart", "chart_title", "series_name", "category_name",
                "part", "notes_paragraph", "table", "section", "heading", "label"}
-    return {key: value for key, value in location.items() if key in allowed}
+    context = {key: value for key, value in location.items() if key in allowed}
+    if len(_json(context)) <= budget:
+        return context
+    context["context_is_excerpt"] = True
+    while len(_json(context)) > budget:
+        key = max((key for key in context if key != "context_is_excerpt"),
+                  key=lambda key: len(_json(context[key])), default=None)
+        if key is None:
+            break
+        value = context[key]
+        text = value if isinstance(value, str) else _json(value)
+        if len(text) <= 8:
+            del context[key]
+        else:
+            length = max(1, len(text) // 4)
+            context[key] = text[:length] + "…" + text[-length:]
+    return context
 
 
 def source_chunks(document: ParsedDocument, budget: int) -> list[dict[str, Any]]:
     """All source characters are covered; offsets always address original blocks."""
     spans: list[dict[str, Any]] = []
     span_size = min(8000, max(320, (budget - 1600) // 2))
+
+    def chunk_for(page: list[dict[str, Any]], before: str = "", after: str = "") -> dict[str, Any]:
+        return {"document_id": document.id, "filename": document.filename,
+                "target_span_ids": [span["span_id"] for span in page], "spans": page,
+                "context_before": before, "context_after": after}
+
     for block in document.blocks:
+        context = _source_context(block.location, min(800, max(80, budget // 6)))
         start = 0
         while start < len(block.text):
             end = min(len(block.text), start + span_size)
@@ -242,23 +265,42 @@ def source_chunks(document: ParsedDocument, budget: int) -> list[dict[str, Any]]
                 matches = list(re.finditer(r"[。！？；\n]", block.text[start + span_size // 2:end]))
                 if matches:
                     end = start + span_size // 2 + matches[-1].end()
-            spans.append({"span_id": f"{block.id}:{start}:{end}", "block_id": block.id,
-                          "document_id": document.id, "offset": start, "text": block.text[start:end],
-                          "kind": block.kind, "context": _source_context(block.location)})
+            while True:
+                span = {"span_id": f"{block.id}:{start}:{end}", "block_id": block.id,
+                        "document_id": document.id, "offset": start, "text": block.text[start:end],
+                        "kind": block.kind, "context": context}
+                if len(_json(chunk_for([span]))) <= budget:
+                    break
+                if end - start <= 1:
+                    raise AgentError("来源位置或文件名超过上下文预算，请增大 LLM_CONTEXT_CHARS")
+                end = start + (end - start) // 2
+            spans.append(span)
             if end == len(block.text):
                 break
             start = max(start + 1, end - min(100, span_size // 4))
-    pages = _pack(spans, max(1200, budget - 1000))
     chunks: list[dict[str, Any]] = []
-    flat_ids = {span["span_id"]: index for index, span in enumerate(spans)}
-    for page in pages:
-        first, last = flat_ids[page[0]["span_id"]], flat_ids[page[-1]["span_id"]]
-        chunks.append({
-            "document_id": document.id, "filename": document.filename,
-            "target_span_ids": [span["span_id"] for span in page], "spans": page,
-            "context_before": spans[first - 1]["text"][-180:] if first else "",
-            "context_after": spans[last + 1]["text"][:180] if last + 1 < len(spans) else "",
-        })
+    first = 0
+    while first < len(spans):
+        last = first
+        chunk = chunk_for([spans[first]])
+        while last < len(spans):
+            candidate = chunk_for(spans[first:last + 1],
+                                  spans[first - 1]["text"][-180:] if first else "",
+                                  spans[last + 1]["text"][:180] if last + 1 < len(spans) else "")
+            if len(_json(candidate)) > budget:
+                if last == first:
+                    # Neighbouring context is already reviewed in its own span.
+                    # Shorten only this optional preview, never source content.
+                    while len(_json(candidate)) > budget and (candidate["context_before"] or candidate["context_after"]):
+                        candidate["context_before"] = candidate["context_before"][len(candidate["context_before"]) // 2 + 1:]
+                        candidate["context_after"] = candidate["context_after"][:len(candidate["context_after"]) // 2]
+                    chunk = candidate
+                    last += 1
+                break
+            chunk = candidate
+            last += 1
+        chunks.append(chunk)
+        first = last
     return chunks
 
 
@@ -282,6 +324,7 @@ def _issue_key(issue: Issue) -> str:
     return _digest({"category": issue.category, "scope": issue.scope,
                     "custom_rule_id": issue.custom_rule_id, "finding_kind": issue.finding_kind,
                     "missing_document_id": issue.missing_document_id,
+                    "title": issue.title, "description": issue.description, "suggestion": issue.suggestion,
                     "evidence": sorted((e.document_id, e.block_id, e.start, e.end, e.quote) for e in issue.evidence)})
 
 
@@ -374,8 +417,12 @@ class ReviewGraph:
             try:
                 saved = json.loads(path.read_text(encoding="utf-8"))
                 if saved["key"] == key and _digest(saved["output"]) == saved["output_hash"]:
-                    return result_type.model_validate(saved["output"])
-            except (OSError, ValueError, KeyError, TypeError):
+                    parsed = result_type.model_validate(saved["output"])
+                    self.validate_result(role, payload, parsed)
+                    return parsed
+            except (OSError, ValueError, KeyError, TypeError, AgentError):
+                # Old checkpoints may have passed only schema validation. Re-run
+                # this result alone; valid sibling checkpoints remain reusable.
                 pass
         async with self.semaphore:
             _check_cancelled(self.cancelled)
@@ -385,9 +432,40 @@ class ReviewGraph:
             parsed = result_type.model_validate(result)
         except ValidationError as exc:
             raise AgentError(f"{role} Agent 返回的结构化结果不符合约定，请检查模型能力后重试") from exc
+        self.validate_result(role, payload, parsed)
         output = parsed.model_dump(mode="json")
         _atomic_json(path, {"key": key, "output_hash": _digest(output), "output": output})
         return parsed
+
+    def validate_result(self, role: str, payload: dict[str, Any], result: BaseModel) -> None:
+        """Apply all role-specific business checks before accepting a checkpoint."""
+        if role in {"proofreader", "facts", "custom_scan", "custom_absence"}:
+            document = next(document for document in self.documents if document.id == payload["document_id"])
+            if role == "facts":
+                self.facts(result, document, payload)
+            elif role == "proofreader":
+                self.check_coverage(result, payload)
+                allowed = {(document.id, span["block_id"]) for span in payload["spans"]}
+                self.candidates(result.issues, "main", {"typo", "punctuation"}, allowed_blocks=allowed)
+            else:
+                self.custom_scan_candidates(result, document, payload, comparison_only=payload["comparison_only"])
+        elif role in {"numeric", "semantic", "cross"}:
+            records = (payload["main_facts"] + payload["other_facts"] if role == "cross"
+                       else payload["left_facts"] + payload["right_facts"])
+            allowed = {(source["document_id"], source["block_id"]) for record in records for source in record["evidence"]}
+            self.candidates(result.issues, "cross" if role == "cross" else "main",
+                            {"numeric", "semantic"} if role == "cross" else {role},
+                            payload.get("other_document_id"), allowed)
+        elif role == "custom_compare":
+            allowed = {(source["document_id"], source["block_id"])
+                       for source in payload["left_sources"] + payload["right_sources"]}
+            self.custom_candidates(result.issues, NormalizedRule.model_validate(payload["rule"]),
+                                   payload["scope"], payload["other_document_id"], allowed)
+        elif role == "verifier":
+            expected = {record["candidate_id"] for record in payload["candidates"]}
+            if ({decision.candidate_id for decision in result.decisions} != expected
+                    or len(result.decisions) != len(expected)):
+                raise AgentError("复核 Agent 未逐一处理所有候选问题，请重试")
 
     async def batch(self, stage: str, jobs: Iterable[tuple[str, dict[str, Any], type[BaseModel]]]) -> list[BaseModel]:
         items = list(jobs)
@@ -511,6 +589,34 @@ class ReviewGraph:
                                custom_rule_id=rule.id, custom_rule_title=rule.title, evidence=ordered))
         return _deduplicate(found)
 
+    def custom_scan_candidates(self, response: CustomScanResult, document: ParsedDocument,
+                               chunk: dict[str, Any], *, comparison_only: bool) -> list[Issue]:
+        self.check_coverage(response, chunk)
+        rules = {rule.id: rule for rule in self.requirements.custom_points}
+        if len(response.rules) != len(rules) or {item.rule_id for item in response.rules} != set(rules):
+            raise AgentError("自定义搜索未逐一覆盖所有审查要点")
+        allowed = {(span["block_id"], span["offset"], span["offset"] + len(span["text"])) for span in chunk["spans"]}
+        candidates: list[Issue] = []
+        for observation in response.rules:
+            rule = rules[observation.rule_id]
+            if (not observation.applicable and (observation.relevant_evidence or observation.satisfied_evidence or observation.issues)
+                    or comparison_only and observation.issues
+                    or rule.kind != "required_content" and observation.satisfied_evidence
+                    or rule.kind == "required_content" and observation.issues):
+                raise AgentError("自定义搜索包含不适用内容、附件独立问题或无效存在判断")
+            for source in (observation.relevant_evidence + observation.satisfied_evidence
+                           + [source for issue in observation.issues for source in issue.evidence]):
+                verified = _verified_evidence(source, self.blocks)
+                if verified is None or verified.document_id != document.id or not any(
+                    verified.block_id == block and start <= verified.start < verified.end <= end
+                    for block, start, end in allowed
+                ):
+                    raise AgentError("自定义搜索包含不存在或不属于当前内容块的原文证据")
+            if not comparison_only:
+                candidates.extend(self.custom_candidates(observation.issues, rule, "main", allowed_blocks={
+                    (document.id, span["block_id"]) for span in chunk["spans"]}))
+        return _deduplicate(candidates)
+
     async def scan_custom(self, document: ParsedDocument, *, comparison_only: bool,
                           independent: bool = False) -> tuple[dict[str, list[RuleObservation]], AbsenceCoverage, list[Issue]]:
         chunks = source_chunks(document, self.budget)
@@ -518,33 +624,11 @@ class ReviewGraph:
             ("custom_absence" if independent else "custom_scan", {**chunk, "comparison_only": comparison_only, "format": document.format}, CustomScanResult)
             for chunk in chunks))
         by_rule: dict[str, list[RuleObservation]] = {rule.id: [] for rule in self.requirements.custom_points}
-        rules = {rule.id: rule for rule in self.requirements.custom_points}
         candidates: list[Issue] = []
         for response, chunk in zip(responses, chunks, strict=True):
-            self.check_coverage(response, chunk)
-            if len(response.rules) != len(rules) or {item.rule_id for item in response.rules} != set(rules):
-                raise AgentError("自定义搜索未逐一覆盖所有审查要点")
-            allowed = {(span["block_id"], span["offset"], span["offset"] + len(span["text"])) for span in chunk["spans"]}
+            candidates.extend(self.custom_scan_candidates(response, document, chunk, comparison_only=comparison_only))
             for observation in response.rules:
-                rule = rules[observation.rule_id]
-                if (not observation.applicable and (observation.relevant_evidence or observation.satisfied_evidence or observation.issues)
-                        or comparison_only and observation.issues
-                        or rule.kind != "required_content" and observation.satisfied_evidence
-                        or rule.kind == "required_content" and observation.issues):
-                    raise AgentError("自定义搜索包含不适用内容、附件独立问题或无效存在判断")
-                for source in (observation.relevant_evidence + observation.satisfied_evidence
-                               + [source for issue in observation.issues for source in issue.evidence]):
-                    verified = _verified_evidence(source, self.blocks)
-                    if verified is None or verified.document_id != document.id or not any(
-                        verified.block_id == block and start <= verified.start < verified.end <= end
-                        for block, start, end in allowed
-                    ):
-                        raise AgentError("自定义搜索包含不存在或不属于当前内容块的原文证据")
-                # Presence evidence is also relevant, even if the model listed it only once.
-                if not comparison_only:
-                    candidates.extend(self.custom_candidates(observation.issues, rule, "main", allowed_blocks={
-                        (document.id, span["block_id"]) for span in chunk["spans"]}))
-                by_rule[rule.id].append(observation)
+                by_rule[observation.rule_id].append(observation)
         coverage = AbsenceCoverage(document_id=document.id,
                                    reviewed_span_ids=[identity for chunk in chunks for identity in chunk["target_span_ids"]],
                                    block_ids=[block.id for block in document.blocks if block.text],

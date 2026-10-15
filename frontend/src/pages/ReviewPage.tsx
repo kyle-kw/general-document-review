@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDownToLine, ArrowLeft, Check, ChevronDown, Clock3, FileCheck2, LoaderCircle, RotateCcw, Square, TriangleAlert } from 'lucide-react'
 import { Link, useParams } from 'react-router-dom'
@@ -33,7 +33,15 @@ export function ReviewPage() {
   const reviewQuery = useQuery({ queryKey: ['review', id], queryFn: () => api.review(id), refetchInterval: query => query.state.data && isActive(query.state.data.status) ? 2000 : false })
   const review = reviewQuery.data
   const issueQuery = useQuery({ queryKey: ['issues', id, page, review?.issue_count, review?.status], queryFn: () => api.issues(id, page), enabled: !!review, refetchInterval: review && isActive(review.status) ? 2000 : false })
-  const action = useMutation({ mutationFn: (value: 'cancel' | 'retry' | { action: 'retry', review_options: ReviewOptions }) => typeof value === 'string' ? api.action(id, value) : api.action(id, value.action, value.review_options), onSuccess: async result => {
+  const issueTotal = issueQuery.data?.total
+  useEffect(() => {
+    if (issueTotal !== undefined) setPage(current => Math.min(current, Math.max(1, Math.ceil(issueTotal / 20))))
+  }, [issueTotal])
+  const action = useMutation({ mutationFn: (value: 'cancel' | 'retry' | { action: 'retry', review_options: ReviewOptions }) => typeof value === 'string' ? api.action(id, value) : api.action(id, value.action, value.review_options), onSuccess: async (result, value) => {
+    if (value !== 'cancel') {
+      setPage(1)
+      setExpanded({})
+    }
     setPointsDraft(null)
     setNotesDraft(null)
     client.setQueryData(['review', id], result)
@@ -87,7 +95,7 @@ export function ReviewPage() {
     {review.artifacts.length > 0 && <section className="report-actions" aria-label={previous ? '上次结果下载' : '下载报告'}>{previous && <span className="previous-label">上次结果</span>}{excel && <a href={api.download(id, 'artifacts', excel.id)} className="button primary" download><ArrowDownToLine size={17} aria-hidden="true" />下载 Excel 报告</a>}{docx && <a href={api.download(id, 'artifacts', docx.id)} className="button secondary" download><ArrowDownToLine size={17} aria-hidden="true" />下载批注文件</a>}{others.length > 0 && <details className="more-downloads"><summary>更多下载<ChevronDown size={16} aria-hidden="true" /></summary><div>{others.map(artifact => <a key={artifact.id} href={api.download(id, 'artifacts', artifact.id)} download>{artifact.name.endsWith('.json') ? 'JSON 审查结果' : artifact.name}</a>)}</div></details>}</section>}
     {warnings.length > 0 && <details className={`panel coverage-panel ${incomplete ? 'coverage-incomplete' : ''}`}><summary><TriangleAlert size={20} aria-hidden="true" /><span><strong>{incomplete ? '审查覆盖不完整' : '解析说明'}</strong><small>查看 {warnings.length} 项解析与覆盖说明</small></span><ChevronDown size={18} className="disclosure-chevron" aria-hidden="true" /></summary><div className="coverage-list">{warnings.map((warning, index) => <div className="coverage-item" key={`${warning.code}-${index}`}><strong>{warning.filename || review.files.find(file => file.id === warning.document_id)?.filename || '文件解析'}</strong><p>{warning.message}</p>{warning.location && <small>{locationText(warning.location)}</small>}</div>)}</div></details>}
     <section className="results-column"><div className="section-heading results-heading"><h2>{previous ? '上次审查问题' : '审查问题'}{(!active || previous) && <span className="count-badge">{review.issue_count}</span>}</h2></div>
-      {issueQuery.isPending ? <div className="panel loading-state" role="status">正在读取问题…</div> : issueQuery.isError ? <ErrorState message={issueQuery.error.message} onRetry={() => void issueQuery.refetch()} /> : issueQuery.data.items.length === 0 ? <div className={`panel empty-state ${successful ? 'successful-empty' : ''}`}><span className="empty-result-icon">{successful ? <Check size={26} aria-hidden="true" /> : active ? <Clock3 size={26} aria-hidden="true" /> : <TriangleAlert size={26} aria-hidden="true" />}</span><h3>{active ? '正在核对文件内容' : successful ? '未发现审查问题' : '暂无审查问题可展示'}</h3><p>{active ? '问题将在证据复核完成后展示。' : successful ? '本次审查范围内未发现明确问题，仍可下载报告。' : '本次审查未完成或覆盖不完整，请结合任务状态使用结果。'}</p></div> : <><div className="issue-list">{issueQuery.data.items.map((issue, index) => {
+      {issueQuery.isPending ? <div className="panel loading-state" role="status">正在读取问题…</div> : issueQuery.isError ? <ErrorState message={issueQuery.error.message} onRetry={() => void issueQuery.refetch()} /> : issueQuery.data.items.length === 0 && (issueQuery.data.total > 0 || review.issue_count > 0) ? <div className="panel empty-state"><span className="empty-result-icon"><TriangleAlert size={26} aria-hidden="true" /></span><h3>当前页暂无问题</h3><p>审查结果中仍有问题，请返回第一页或重新读取列表查看。</p><button className="button secondary" onClick={() => page > 1 ? setPage(1) : void issueQuery.refetch()}>{page > 1 ? '返回第一页' : '重新读取问题'}</button></div> : issueQuery.data.items.length === 0 ? <div className={`panel empty-state ${successful ? 'successful-empty' : ''}`}><span className="empty-result-icon">{successful ? <Check size={26} aria-hidden="true" /> : active ? <Clock3 size={26} aria-hidden="true" /> : <TriangleAlert size={26} aria-hidden="true" />}</span><h3>{active ? '正在核对文件内容' : successful ? '未发现审查问题' : '暂无审查问题可展示'}</h3><p>{active ? '问题将在证据复核完成后展示。' : successful ? '本次审查范围内未发现明确问题，仍可下载报告。' : '本次审查未完成或覆盖不完整，请结合任务状态使用结果。'}</p></div> : <><div className="issue-list">{issueQuery.data.items.map((issue, index) => {
         const open = expanded[issue.id] ?? (page === 1 && index === 0)
         return <IssueCard key={issue.id} issue={issue} review={review} number={(page - 1) * 20 + index + 1} open={open} onToggle={() => setExpanded(current => ({ ...current, [issue.id]: !open }))} />
       })}</div><Pagination page={page} total={issueQuery.data.total} size={20} onPage={setPage} /></>}

@@ -232,6 +232,50 @@ async def test_model_failure_is_terminal_without_half_published_results(setup_re
     assert not item["artifacts"] and not list(directory.glob("output-*"))
 
 
+async def test_cancellation_between_snapshot_and_claim_is_immediately_terminal(setup_review, monkeypatch) -> None:
+    settings, store, create = setup_review
+    identifier, directory = create()
+    original_get = store.get
+    captured = False
+
+    def cancel_after_snapshot(*args, **kwargs):
+        nonlocal captured
+        item = original_get(*args, **kwargs)
+        if not captured:
+            captured = True
+            store.update(identifier, cancel_requested=1)
+        return item
+
+    monkeypatch.setattr(store, "get", cancel_after_snapshot)
+    await jobs.execute_review(identifier, settings, store)
+    item = original_get(identifier)
+    assert item["status"] == "cancelled"
+    assert item["finished_at"] and item["expires_at"]
+    assert not DeterministicAgents.calls and not item["artifacts"]
+    assert not list(directory.glob("output-*"))
+
+
+async def test_retry_does_not_reuse_older_parser_cache(setup_review) -> None:
+    settings, store, create = setup_review
+    identifier, directory = create(reference="none")
+    workspace = directory / "work"
+    workspace.mkdir()
+    import hashlib
+    from app.models import Block, ParsedDocument
+    source = directory / "originals" / "main.docx"
+    fingerprint = hashlib.sha256(source.read_bytes()).hexdigest()
+    old_key = hashlib.sha256(f"parser-v1:{fingerprint}:{settings.paddleocr_url}:{settings.paddleocr_batch_pages}".encode()).hexdigest()
+    stale = ParsedDocument(id="main", filename="主文件.docx", format="docx", blocks=[
+        Block(id="stale", document_id="main", text="Stale incomplete extraction", kind="paragraph", location={})])
+    jobs.atomic_json(workspace / "parsed-main.json", {"key": old_key, "document": stale.model_dump()})
+    await jobs.execute_review(identifier, settings, store)
+    item = store.get(identifier, private=True)
+    assert item["status"] == "completed", item["error"]
+    assert item["issue_count"] == 2
+    assert "项目计化。" in [block["text"] for block in item["documents"][0]["blocks"]]
+    assert "stale" not in [block["id"] for block in item["documents"][0]["blocks"]]
+
+
 async def test_retry_reuses_complete_main_checkpoints_and_replaces_registered_artifacts(setup_review) -> None:
     settings, store, create = setup_review
     identifier, directory = create(reference="corrupt")
