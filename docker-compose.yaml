@@ -1,0 +1,84 @@
+x-backend-environment: &backend-environment
+  APP_NAME: "${APP_NAME:-general-document-review}"
+  DATA_DIR: /app/data
+  REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+  RQ_QUEUE: "${RQ_QUEUE:-general-document-review}"
+  RQ_JOB_TIMEOUT: "${RQ_JOB_TIMEOUT:-14400}"
+  RQ_RESULT_TTL: "${RQ_RESULT_TTL:-3600}"
+  RQ_FAILURE_TTL: "${RQ_FAILURE_TTL:-86400}"
+  LLM_BASE_URL: "${LLM_BASE_URL:-}"
+  LLM_API_KEY: "${LLM_API_KEY:-}"
+  LLM_MODEL: "${LLM_MODEL:-}"
+  LLM_TIMEOUT: "${LLM_TIMEOUT:-300}"
+  LLM_CONTEXT_CHARS: "${LLM_CONTEXT_CHARS:-48000}"
+  LLM_MAX_RETRIES: "${LLM_MAX_RETRIES:-2}"
+  AGENT_CONCURRENCY: "${AGENT_CONCURRENCY:-2}"
+  SANDBOX_COMMAND_TIMEOUT: "${SANDBOX_COMMAND_TIMEOUT:-60}"
+  SANDBOX_OUTPUT_BYTES: "${SANDBOX_OUTPUT_BYTES:-1048576}"
+  SANDBOX_MEMORY_MB: "${SANDBOX_MEMORY_MB:-512}"
+  SANDBOX_PIDS_LIMIT: "${SANDBOX_PIDS_LIMIT:-64}"
+  SANDBOX_FILE_MB: "${SANDBOX_FILE_MB:-128}"
+  SANDBOX_WORKSPACE_MB: "${SANDBOX_WORKSPACE_MB:-256}"
+  SANDBOX_OFFICECLI_AS_MB: "${SANDBOX_OFFICECLI_AS_MB:-4096}"
+  PADDLEOCR_URL: "${PADDLEOCR_URL:-}"
+  PADDLEOCR_TOKEN: "${PADDLEOCR_TOKEN:-}"
+  PADDLEOCR_BATCH_PAGES: "${PADDLEOCR_BATCH_PAGES:-10}"
+  PADDLEOCR_TIMEOUT: "${PADDLEOCR_TIMEOUT:-180}"
+  RETENTION_DAYS: "${RETENTION_DAYS:-30}"
+  MAX_FILES: "${MAX_FILES:-20}"
+  MAX_FILE_MB: "${MAX_FILE_MB:-100}"
+  MAX_UNPACKED_MB: "${MAX_UNPACKED_MB:-1024}"
+  COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+  ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}"
+
+services:
+  web:
+    image: general-document-review-web:0.1.0
+    platform: linux/amd64
+    build:
+      context: .
+      target: web
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment: *backend-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - app-data:/app/data
+    restart: unless-stopped
+  worker:
+    image: general-document-review-worker:0.1.0
+    platform: linux/amd64
+    build:
+      context: .
+      target: worker
+    environment: *backend-environment
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./deploy/seccomp-bwrap.json
+    pids_limit: 512
+    mem_limit: 2g
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - app-data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 14500s
+  redis:
+    image: redis:7.4-alpine
+    platform: linux/amd64
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+volumes:
+  app-data:
+  redis-data:

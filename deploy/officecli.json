@@ -1,0 +1,9 @@
+{
+  "version": "1.0.157",
+  "commit": "b65272a18aef891941451705ff93e8a287f3eb72",
+  "platform": "linux/amd64",
+  "asset": "officecli-linux-x64",
+  "url": "https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.157/officecli-linux-x64",
+  "sha256": "f8eefe88dbfa7464bee421e5421efe57fc26bc3180b30e56eef58594c8245c94",
+  "license": "Apache-2.0"
+}

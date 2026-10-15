@@ -1,0 +1,45 @@
+{
+  "version": "1.0.157",
+  "commit": "b65272a18aef891941451705ff93e8a287f3eb72",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/iOfficeAI/OfficeCLI",
+  "binary_sha256": "f8eefe88dbfa7464bee421e5421efe57fc26bc3180b30e56eef58594c8245c94",
+  "files": [
+    {
+      "path": "upstream/SKILL.md",
+      "source": "https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/b65272a18aef891941451705ff93e8a287f3eb72/skills/officecli/SKILL.md",
+      "sha256": "c950d285ce60021712b4753fb2d9f592308d5622bab776229061dfecb1ce55d4"
+    },
+    {
+      "path": "upstream/docx.md",
+      "source": "https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/b65272a18aef891941451705ff93e8a287f3eb72/skills/officecli-docx/SKILL.md",
+      "sha256": "4dbeacba4bd107417fc31204ce22e91b37e5747d0541090d75ebb0ed14e02559"
+    },
+    {
+      "path": "upstream/xlsx.md",
+      "source": "https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/b65272a18aef891941451705ff93e8a287f3eb72/skills/officecli-xlsx/SKILL.md",
+      "sha256": "95ed125c9c06defda5a9abc9a9a1d7329e8b183c74a4a6b9b8eab2e1529ebb90"
+    },
+    {
+      "path": "upstream/pptx.md",
+      "source": "https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/b65272a18aef891941451705ff93e8a287f3eb72/skills/officecli-pptx/SKILL.md",
+      "sha256": "0d53192751d5770984f16f3c34f9923377651555c667150d7f96e16e8c9757b3"
+    },
+    {
+      "path": "LICENSE",
+      "source": "https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/b65272a18aef891941451705ff93e8a287f3eb72/LICENSE",
+      "sha256": "7e282402a5a6db33995fe638bb3fe79013f9884d8f7d15a42e481c1e86aadda1"
+    },
+    {
+      "path": "NOTICE",
+      "source": "https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/b65272a18aef891941451705ff93e8a287f3eb72/NOTICE",
+      "sha256": "3a4715b268e148a8e9566f5e835f766f5c95c3da4d6e5ddd908806a258a2f07b"
+    },
+    {
+      "path": "THIRD-PARTY-NOTICES.txt",
+      "source": "https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/b65272a18aef891941451705ff93e8a287f3eb72/THIRD-PARTY-NOTICES.txt",
+      "sha256": "7e79e54cddf05f25681198429eb42e1401c1c53a3b29bf63744dc09411c029d8"
+    }
+  ],
+  "adaptation": "SKILL.md is an application-owned review-only adaptation; upstream skills are retained for provenance and are not automatically loaded."
+}
