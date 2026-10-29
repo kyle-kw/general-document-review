@@ -137,16 +137,19 @@ ROLES = {
     "numeric": """[numeric] 你是主文件数值一致性 Agent。比较给出的全文事实索引分支中所有同类
 主体、指标和数值陈述，识别同义词、别名及等价单位。分支可能来自相距很远的章节。
 同一分支内部或两个分支之间的不兼容数值才报 numeric；必须有至少两处不同原文证据。
+只返回 category=numeric 的问题；错别字、标点及非数值语义问题由其他步骤负责，不要输出。
 不要自行选正确值；缺少单位/时间等关键条件时 confidence=needs_confirmation。
 不能因主体/指标字面不同跳过同义断言，也不能把总量和子项、计划和实际强行等同。""",
     "semantic": """[semantic] 你是主文件语义一致性 Agent。比较全文事实索引分支中的定义、名称、
 责任、要求、结论、条件和否定，识别别名和同义表述，找出逻辑不兼容的 semantic 问题。
 必须有至少两处不同原文证据；纯数值冲突交给数值 Agent。不同时间、条件或范围可以同时成立。
+只返回 category=semantic 的问题；错别字、标点及纯数值问题由其他步骤负责，即使发现也不要输出。
 不能凭未提到某事实推断矛盾，不能加入常识性纠错或文风建议。""",
     "cross": """[cross] 你是跨文件一致性 Agent。main_facts 是主文件全文索引的一部分，
 other_facts 是一份其他文件的事实；各批次组合会由程序完整遍历。
 只找主文件与其他文件之间的 numeric/semantic 冲突，识别别名、同义词、单位换算及时间范围。
-每个问题必须有主文件证据和此其他文件证据；不检查其他文件错字、标点、自身一致性。
+只返回 category=numeric 或 semantic 的问题；不检查其他文件错字、标点、自身一致性。
+每个问题必须有主文件证据和此其他文件证据。
 主文件是对照基准，但不代表客观真值；主文件本身矛盾时应标为基准歧义待确认。""",
     "verifier": """[verifier] 你是独立证据复核 Agent。只审核给出的候选问题，不新增问题。
 逐一回查提供的原文片段、限定条件与双方证据，排除引文不支持、单位可换算、时间/范围不同、
@@ -425,17 +428,30 @@ class ReviewGraph:
                 # this result alone; valid sibling checkpoints remain reusable.
                 pass
         async with self.semaphore:
-            _check_cancelled(self.cancelled)
-            result = await self.client.run_agent(COMMON + ROLES[role], payload, result_type.model_json_schema())
-            _check_cancelled(self.cancelled)
-        try:
-            parsed = result_type.model_validate(result)
-        except ValidationError as exc:
-            raise AgentError(f"{role} Agent 返回的结构化结果不符合约定，请检查模型能力后重试") from exc
-        self.validate_result(role, payload, parsed)
-        output = parsed.model_dump(mode="json")
-        _atomic_json(path, {"key": key, "output_hash": _digest(output), "output": output})
-        return parsed
+            # Model output can occasionally violate a role's business contract even
+            # when the JSON Schema passes (for example, returning an out-of-scope
+            # category or an unverifiable quote). Re-run that step once instead of
+            # failing the whole review; invalid output is never accepted as a pass.
+            for attempt in range(2):
+                _check_cancelled(self.cancelled)
+                result = await self.client.run_agent(COMMON + ROLES[role], payload, result_type.model_json_schema())
+                _check_cancelled(self.cancelled)
+                try:
+                    parsed = result_type.model_validate(result)
+                except ValidationError as exc:
+                    if attempt == 1:
+                        raise AgentError(f"{role} Agent 返回的结构化结果不符合约定，请检查模型能力后重试") from exc
+                    continue
+                try:
+                    self.validate_result(role, payload, parsed)
+                except AgentError:
+                    if attempt == 1:
+                        raise
+                    continue
+                output = parsed.model_dump(mode="json")
+                _atomic_json(path, {"key": key, "output_hash": _digest(output), "output": output})
+                return parsed
+            raise AgentError(f"{role} Agent 未返回有效结果，请重试")
 
     def validate_result(self, role: str, payload: dict[str, Any], result: BaseModel) -> None:
         """Apply all role-specific business checks before accepting a checkpoint."""
@@ -516,10 +532,16 @@ class ReviewGraph:
                    allowed_blocks: set[tuple[str, str]] | None = None) -> list[Issue]:
         result: list[Issue] = []
         for item in proposed:
+            if item.category not in categories:
+                # Models sometimes volunteer findings from another role (for example,
+                # a typo during semantic consistency). That category has its own
+                # dedicated step, so ignore the extra item instead of failing the
+                # whole review. Evidence and scope checks below remain strict.
+                self.warn("模型返回了当前步骤范围外类别的问题，已忽略；对应类别由专门步骤负责。")
+                continue
             evidence = [_verified_evidence(e, self.blocks) for e in item.evidence]
-            valid = item.category in categories and not any(e is None for e in evidence)
+            valid = not any(e is None for e in evidence)
             if valid:
-                refs = {(e.document_id, e.block_id, e.start, e.end) for e in evidence if e is not None}
                 ids = {e.document_id for e in evidence if e is not None}
                 valid = (ids == {self.main.id} if scope == "main" else ids == {self.main.id, other_id})
                 valid = valid and (item.category in {"typo", "punctuation"} or _independent_sources(evidence))

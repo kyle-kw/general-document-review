@@ -166,6 +166,46 @@ async def test_invalid_issue_evidence_fails_instead_of_false_zero_result(tmp_pat
         await run_review(docs, FakeClient(invalid=True), tmp_path, lambda *_: None, lambda: False)
 
 
+async def test_out_of_scope_categories_are_ignored_without_failing(tmp_path):
+    class Extras(FakeClient):
+        async def run_agent(self, role, input, schema):
+            result = await super().run_agent(role, input, schema)
+            if "[semantic]" in role:
+                source = (input["left_facts"] or input["right_facts"])[0]["evidence"][0]
+                evidence = [{key: source[key] for key in ("document_id", "block_id", "quote", "start", "end")}]
+                result["issues"] = [proposed("typo", evidence), proposed("punctuation", evidence)]
+            return result
+
+    docs = [document("main", ["金额100元。", "金额200元。"])]
+    issues = await run_review(docs, Extras(), tmp_path, lambda *_: None, lambda: False)
+    assert {issue.category for issue in issues} == {"numeric"}
+    assert any(warning.code == "invalid_model_evidence" and warning.incomplete is False
+               for warning in docs[0].warnings)
+
+
+async def test_business_validation_failure_retries_the_step_once(tmp_path):
+    class InvalidOnce(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.semantic_failures = 0
+
+        async def run_agent(self, role, input, schema):
+            result = await super().run_agent(role, input, schema)
+            if "[semantic]" in role and self.semantic_failures == 0:
+                self.semantic_failures += 1
+                result["issues"] = [proposed("semantic", [{
+                    "document_id": "main", "block_id": "absent", "quote": "不存在的引文",
+                    "start": 0, "end": 7}])]
+            return result
+
+    client = InvalidOnce()
+    issues = await run_review([document("main", ["金额100元。", "金额200元。"])],
+                              client, tmp_path, lambda *_: None, lambda: False)
+    assert {issue.category for issue in issues} == {"numeric"}
+    assert client.semantic_failures == 1
+    assert sum(role == "semantic" for role, _ in client.calls) == 2
+
+
 async def test_independent_verifier_can_reject_candidates(tmp_path):
     issues = await run_review([document("main", ["含错别自。金额100元。", "金额200元。"])],
                               FakeClient(reject=True), tmp_path, lambda *_: None, lambda: False)
